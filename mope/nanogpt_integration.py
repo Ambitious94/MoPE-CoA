@@ -83,7 +83,7 @@ def attach_mope_to_nanogpt(
     return model
 
 
-def replace_ffn_with_torch_mope(block, hidden_size: int, expert_names, gate_json: dict | None = None) -> TorchMoPELayer:
+def replace_ffn_with_torch_mope(block, hidden_size: int, expert_names, gate_json: dict | None = None, *, use_adapters: bool = True) -> TorchMoPELayer:
     """Replace a single nanoGPT block's MLP with TorchMoPELayer.
 
     - hidden_size: model hidden dimension
@@ -94,7 +94,7 @@ def replace_ffn_with_torch_mope(block, hidden_size: int, expert_names, gate_json
     import torch
     import torch.nn as nn
 
-    mope = TorchMoPELayer(hidden_size=hidden_size, expert_names=expert_names)
+    mope = TorchMoPELayer(hidden_size=hidden_size, expert_names=expert_names, use_adapters=use_adapters)
     if gate_json is not None:
         mope.load_gate_json(gate_json)
 
