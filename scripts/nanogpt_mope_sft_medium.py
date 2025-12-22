@@ -270,11 +270,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     h = block.ln_2.register_forward_hook(hook_ln2)
 
-    # AMP: use torch.amp API
-    scaler = torch.amp.GradScaler(
-        device_type=("cuda" if device.type == "cuda" else "cpu"),
-        enabled=bool(args.amp) and device.type == "cuda",
-    )
+    # AMP: use torch.amp API; pass device as positional arg per PyTorch versions
+    _dev_str = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(_dev_str, enabled=bool(args.amp) and device.type == "cuda")
 
     gpt.train()  # we'll compute LM loss; some params may be frozen
     for epoch in range(int(args.epochs)):

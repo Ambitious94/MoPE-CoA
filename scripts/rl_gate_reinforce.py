@@ -39,7 +39,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from mope.data_prep import preprocess_record, build_route_batch_from_structured
+from mope.data_prep import parse_coa_output
 from mope.pipeline import PIPELINE_REGISTRY
 from mope.nanogpt_integration import replace_ffn_with_torch_mope
 
@@ -136,19 +136,30 @@ class OpenAIJudge(Judge):
             return 0
 
 
-def _build_dataset(input_path: Path, hidden_size: int) -> List[Sample]:
+def _build_dataset(input_path: Path, hidden_size: int, args) -> List[Sample]:
     raw = _load_records(input_path)
-    structured = [
-        preprocess_record(r, hidden_size=hidden_size, with_instruction=False, drop_observation_content=True)
-        for r in raw
-    ]
-    # Use inputs as prompts; take parsed target_answer when available
     samples: List[Sample] = []
-    for r in structured:
-        q = (r.get("input") or "").strip()
-        t = (r.get("target_answer") or "").strip() or None
-        if q:
-            samples.append(Sample(text=q, target=t))
+    in_key = str(getattr(args, "input_key", "input") or "input")
+    tgt_key = str(getattr(args, "target_key", "target_answer") or "target_answer")
+    out_key = str(getattr(args, "output_key", "output") or "output")
+    parse_coa = bool(getattr(args, "parse_coa_output", True))
+
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        q = (str(r.get(in_key) or r.get("input") or "")).strip()
+        if not q:
+            continue
+        t: str | None = None
+        tv = r.get(tgt_key) if tgt_key in r else r.get("target_answer")
+        if tv is not None:
+            t = str(tv).strip() or None
+        if t is None and parse_coa:
+            ov = r.get(out_key) if out_key in r else r.get("output")
+            if isinstance(ov, str) and ("<answer>" in ov or "</answer>" in ov):
+                _steps, ans = parse_coa_output(ov)
+                t = (ans or "").strip() or None
+        samples.append(Sample(text=q, target=t))
     return samples
 
 
@@ -161,6 +172,7 @@ def generate_with_mope(
     temperature: float,
     top_k: Optional[int],
     device: torch.device,
+    sample_actions: bool = True,
 ) -> Tuple[str, List[int], torch.Tensor]:
     """Generate text with per-step gating decisions at the selected block.
 
@@ -192,9 +204,13 @@ def generate_with_mope(
         # policy over experts
         logits = X @ mope_layer.gate.weight + mope_layer.gate.bias  # [B,E]
         probs = torch.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs=probs)
-        action = int(dist.sample().item())
-        logp = dist.log_prob(torch.tensor([action], device=probs.device)).squeeze(0)
+        if sample_actions:
+            dist = torch.distributions.Categorical(probs=probs)
+            action = int(dist.sample().item())
+            logp = dist.log_prob(torch.tensor([action], device=probs.device)).squeeze(0)
+        else:
+            action = int(torch.argmax(probs, dim=-1)[0].item())
+            logp = torch.log(probs[0, action] + 1e-12)
         actions.append(action)
         log_probs.append(logp)
         # 2) force expert and do actual forward for logits
@@ -228,12 +244,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--aux-lm-weight", type=float, default=0.5, help="Weight for auxiliary LM loss to train expert adapters")
+    ap.add_argument("--eval-only", action="store_true", help="Evaluation only: no training, report average judge reward")
     ap.add_argument("--unfreeze-last", type=int, default=0)
     ap.add_argument("--judge", type=str, default="mock", choices=["mock", "openai"])
     ap.add_argument("--judge-model", type=str, default="gpt-4o-mini")
     ap.add_argument("--use-adapters", action="store_true", help="Use trainable expert adapters inside MoPE (default)")
     ap.add_argument("--no-adapters", dest="use_adapters", action="store_false", help="Disable adapters; use vectorizer-only residuals")
     ap.set_defaults(use_adapters=True)
+    # Data field mapping (to support non-SFT formats)
+    ap.add_argument("--input-key", type=str, default="input", help="Field name for prompt text")
+    ap.add_argument("--target-key", type=str, default="target_answer", help="Field name for target answer (optional)")
+    ap.add_argument("--output-key", type=str, default="output", help="Field name with CoA-tagged output to parse <answer> when target missing")
+    ap.add_argument("--no-parse-coa-output", dest="parse_coa_output", action="store_false", help="Disable parsing <answer> from output field")
+    ap.set_defaults(parse_coa_output=True)
     ap.add_argument("--out", type=str, default="gate.json")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
@@ -276,7 +299,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     # Dataset
     hidden_size = int(getattr(gpt.config, "n_embd", 768))
-    samples = _build_dataset(input_path, hidden_size=hidden_size)
+    samples = _build_dataset(input_path, hidden_size=hidden_size, args=args)
     if len(samples) == 0:
         print("No prompts found. Exiting.")
         return 1
@@ -299,10 +322,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         optimizer = torch.optim.AdamW(mope_layer.gate.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     # AMP scaler
-    scaler = torch.amp.GradScaler(
-        device_type=("cuda" if device.type == "cuda" else "cpu"),
-        enabled=bool(args.amp) and device.type == "cuda",
-    )
+    _dev_str = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(_dev_str, enabled=bool(args.amp) and device.type == "cuda")
 
     # Judge
     if args.judge == "openai":
@@ -316,6 +337,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     gpt.train(False)
 
+    total_R = 0.0
     for ep in range(int(args.episodes)):
         sample = random.choice(samples)
         prompt = sample.text
@@ -333,9 +355,16 @@ def main(argv: Iterable[str] | None = None) -> int:
                 temperature=float(args.temperature),
                 top_k=args.top_k,
                 device=device,
+                sample_actions=(not bool(args.eval_only)),
             )
         # Judge 0/1
         R = judge.score(prompt, text)
+        total_R += float(R)
+        # If eval-only, skip training and continue
+        if bool(args.eval_only):
+            print(f"eval {ep+1}/{args.episodes} R={R} actions={actions[:8]}...")
+            continue
+
         # REINFORCE loss: -(R - b) * sum(logpi)
         advantage = float(R) - baseline
         loss = -(log_probs.sum() * advantage)
@@ -375,6 +404,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         baseline = beta * baseline + (1 - beta) * float(R)
 
         print(f"ep {ep+1}/{args.episodes} R={R} adv={advantage:.3f} actions={actions[:8]}... logp_sum={float(log_probs.sum().item()):.3f}")
+
+    # If evaluation only, report summary and exit
+    if bool(args.eval_only):
+        avg_R = total_R / max(1, int(args.episodes))
+        print(f"Eval-only: average reward over {int(args.episodes)} episodes = {avg_R:.4f}")
+        return 0
 
     # Save gate
     out = {
