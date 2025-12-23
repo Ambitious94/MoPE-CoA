@@ -32,10 +32,13 @@ import re
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Optional
+import hashlib
+import time
 
 import torch
 from mope.nanogpt_integration import replace_ffn_with_torch_mope
 from mope.pipeline import PIPELINE_REGISTRY
+from mope.tools import serpapi_search, serpapi_search_raw, jina_crawl
 
 
 def _maybe_add_repo_to_syspath(root: Path) -> None:
@@ -60,6 +63,29 @@ def _load_rows(path: Path) -> List[dict]:
                 return v
         return [obj]
     return []
+
+
+def _cache_path(root: Path, key: str) -> Path:
+    h = hashlib.sha1(key.encode('utf-8')).hexdigest()
+    return root / 'search' / f"{h}.json"
+
+
+def _cache_get(root: Path, key: str) -> Optional[str]:
+    p = _cache_path(root, key)
+    if p.exists():
+        try:
+            obj = json.loads(p.read_text(encoding='utf-8'))
+            return str(obj.get('result') or '')
+        except Exception:
+            return None
+    return None
+
+
+def _cache_put(root: Path, key: str, result: str) -> None:
+    p = _cache_path(root, key)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"query": key, "result": result, "ts": int(time.time())}
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def _normalize_text(s: str) -> str:
@@ -149,6 +175,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument("--use-adapters", action="store_true", help="Use trainable expert adapters inside MoPE (default)")
     ap.add_argument("--no-adapters", dest="use_adapters", action="store_false", help="Disable adapters; use vectorizer-only residuals")
     ap.set_defaults(use_adapters=True)
+    # Retrieval options
+    ap.add_argument("--use-tools", action="store_true", help="Enable retrieval to build context (SerpAPI)")
+    ap.add_argument("--search-backend", type=str, default="serpapi", choices=["serpapi", "jina", "none"], help="Retrieval backend (search). Use serpapi when composing with crawl.")
+    ap.add_argument("--serpapi-key", type=str, default=None, help="SerpAPI key (or use env SERPAPI_API_KEY)")
+    ap.add_argument("--search-topk", type=int, default=3, help="Top-k search results to summarize")
+    ap.add_argument("--cache-dir", type=str, default=".mope_cache", help="Directory to cache retrieval results")
+    ap.add_argument("--tools-no-inject", action="store_true", help="Run tools (search/crawl) but do NOT inject context into the prompt")
+    ap.add_argument("--jina-key", type=str, default=None, help="Jina API key (or use env JINA_API_KEY)")
+    ap.add_argument("--use-crawl", action="store_true", help="Enable crawl step after search to fetch page content via Jina")
+    ap.add_argument("--crawl-topk", type=int, default=1, help="Crawl top-K URLs from search results")
+    ap.add_argument("--dump-eval", type=str, default=None, help="Optional JSONL path to dump per-sample results and tool summaries")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     data_path = Path(args.data)
@@ -203,6 +240,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     total_f1 = 0.0
     total_n = 0
 
+    cache_root = Path(str(args.cache_dir))
+    dump_fp = None
+    if args.dump_eval:
+        try:
+            dump_fp = open(args.dump_eval, "w", encoding="utf-8")
+        except Exception as e:
+            print("Failed to open dump file:", e)
+            dump_fp = None
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -210,13 +255,90 @@ def main(argv: Iterable[str] | None = None) -> int:
         a = str(r.get(args.target_key) or "").strip()
         if not q:
             continue
-        enc = tok(q, padding=False, truncation=True, max_length=gpt.config.block_size, return_tensors="pt")
+        # Optionally retrieve context via tools (cached)
+        inp_text = q
+        summary = None
+        summary_injected = False
+        cache_hit = False
+        backend = args.search_backend
+        urls: List[str] = []
+        crawl_summaries: List[str] = []
+        if bool(args.use_tools):
+            # 1) Search phase
+            summary = _cache_get(cache_root, f"search:{q}")
+            if summary is None:
+                try:
+                    if args.search_backend == "serpapi":
+                        key = args.serpapi_key or os.getenv("SERPAPI_API_KEY")
+                        if key:
+                            summary = serpapi_search(q, api_key=key, top_k=int(args.search_topk))
+                            # Also gather URLs for optional crawl
+                            results = serpapi_search_raw(q, api_key=key, top_k=int(args.search_topk))
+                            urls = [r.get("link") for r in results if r.get("link")]
+                    elif args.search_backend == "jina":
+                        key = args.jina_key or os.getenv("JINA_API_KEY")
+                        if key:
+                            summary = jina_crawl(q, api_key=key, top_k=1)
+                except Exception as e:
+                    summary = f"tool_error: {e}"
+                _cache_put(cache_root, f"search:{q}", summary or "")
+            else:
+                cache_hit = True
+                # On cache hit for search, try to also load cached url list if present (not stored separately -> recompute lazily on next miss)
+
+            # 2) Crawl phase (optional, only if we have URLs)
+            if bool(args.use_crawl) and urls:
+                topk = max(1, int(args.crawl_topk))
+                for url in urls[:topk]:
+                    cached = _cache_get(cache_root, f"crawl:{url}")
+                    if cached is None:
+                        try:
+                            key = args.jina_key or os.getenv("JINA_API_KEY")
+                            if key:
+                                cached = jina_crawl(url, api_key=key, top_k=1)
+                        except Exception as e:
+                            cached = f"tool_error: {e}"
+                        _cache_put(cache_root, f"crawl:{url}", cached or "")
+                    if cached:
+                        crawl_summaries.append(cached)
+            # Only inject if allowed and summary looks valid
+            if (not bool(args.tools_no_inject)):
+                context_parts: List[str] = []
+                if summary and not str(summary).startswith("tool.web_search") and not str(summary).startswith("tool_error"):
+                    context_parts.append(summary)
+                for cs in crawl_summaries:
+                    if cs and not str(cs).startswith("tool_error"):
+                        context_parts.append(cs)
+                if context_parts:
+                    # Concatenate with separator and trim
+                    combined = " \n---\n ".join(context_parts)
+                    inp_text = f"Question: {q}\nContext: {combined}\nAnswer:"
+                    summary_injected = True
+                summary_injected = True
+        enc = tok(inp_text, padding=False, truncation=True, max_length=gpt.config.block_size, return_tensors="pt")
         input_ids = enc["input_ids"].to(device)
         pred = generate_answer(gpt, block, mope_layer, tok, input_ids, max_new_tokens=int(args.max_new_tokens), temperature=float(args.temperature), top_k=args.top_k)
         if a:
             total_em += _exact_match(pred, a)
             total_f1 += _f1_score(pred, a)
         total_n += 1
+        if dump_fp is not None:
+            try:
+                row = {
+                    "question": q,
+                    "gold": a,
+                    "pred": pred,
+                    "tools_enabled": bool(args.use_tools),
+                    "backend": backend,
+                    "cache_hit": cache_hit,
+                    "summary_injected": summary_injected,
+                    "summary": (summary[:500] + ("..." if summary and len(summary) > 500 else "")) if isinstance(summary, str) else None,
+                    "urls": urls[:5],
+                    "crawl_summaries": [ (cs[:300] + ("..." if len(cs) > 300 else "")) for cs in crawl_summaries[:3] ] if crawl_summaries else [],
+                }
+                dump_fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
         if total_n % 50 == 0:
             print(f"Processed {total_n} samples...")
 
@@ -240,6 +362,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         },
     }, ensure_ascii=False, indent=2))
 
+    if dump_fp is not None:
+        try:
+            dump_fp.close()
+        except Exception:
+            pass
     return 0
 
 

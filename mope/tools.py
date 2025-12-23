@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from typing import List
+from typing import List, Dict, Any
 
 try:
     import requests
@@ -48,6 +48,37 @@ def serpapi_search(prompt: str, api_key: str | None = None, top_k: int = 3) -> s
     if not results:
         return f"tool.web_search: no results | prompt='{prompt}'"
     return " | ".join(results)
+
+
+def serpapi_search_raw(prompt: str, api_key: str | None = None, top_k: int = 3) -> List[Dict[str, Any]]:
+    """Call SerpAPI and return a structured list of results with URLs.
+
+    Returns list of {title, link, snippet}.
+    """
+    _require_requests()
+    key = api_key or os.getenv("SERPAPI_API_KEY")
+    if not key:
+        return []
+    url = "https://serpapi.com/search.json"
+    params = {
+        "q": prompt,
+        "api_key": key,
+        "num": max(1, top_k),
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in (data.get("organic_results") or [])[:top_k]:
+        out.append({
+            "title": item.get("title") or "",
+            "link": item.get("link") or "",
+            "snippet": item.get("snippet") or item.get("summary") or "",
+        })
+    return out
 
 
 def jina_crawl(prompt: str, api_key: str | None = None, top_k: int = 1) -> str:
