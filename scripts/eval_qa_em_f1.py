@@ -132,6 +132,7 @@ def generate_answer(gpt, block, mope_layer, tok, question_ids: torch.Tensor, max
     h = block.ln_2.register_forward_hook(hook_ln2)
 
     idx = question_ids.clone()
+    start_len = int(idx.shape[1])
     for _ in range(int(max_new_tokens)):
         idx_cond = idx if idx.size(1) <= gpt.config.block_size else idx[:, -gpt.config.block_size:]
         captured.clear()
@@ -156,7 +157,9 @@ def generate_answer(gpt, block, mope_layer, tok, question_ids: torch.Tensor, max
         idx = torch.cat((idx, idx_next), dim=1)
 
     h.remove()
-    return tok.decode(idx[0].tolist(), skip_special_tokens=True)
+    # Decode only the generated continuation, not the original prompt
+    gen_tokens = idx[0, start_len:]
+    return tok.decode(gen_tokens.tolist(), skip_special_tokens=True)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -244,7 +247,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     dump_fp = None
     if args.dump_eval:
         try:
-            dump_fp = open(args.dump_eval, "w", encoding="utf-8")
+            dump_path = Path(str(args.dump_eval))
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            dump_fp = open(dump_path, "w", encoding="utf-8")
         except Exception as e:
             print("Failed to open dump file:", e)
             dump_fp = None
