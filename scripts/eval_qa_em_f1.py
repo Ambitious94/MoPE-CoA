@@ -189,6 +189,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument("--use-crawl", action="store_true", help="Enable crawl step after search to fetch page content via Jina")
     ap.add_argument("--crawl-topk", type=int, default=1, help="Crawl top-K URLs from search results")
     ap.add_argument("--dump-eval", type=str, default=None, help="Optional JSONL path to dump per-sample results and tool summaries")
+    ap.add_argument("--deterministic", action="store_true", help="Use deterministic decoding (temperature=0, top-k disabled)")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     data_path = Path(args.data)
@@ -232,6 +233,22 @@ def main(argv: Iterable[str] | None = None) -> int:
     tok = GPT2TokenizerFast.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token
 
+    def _encode_with_answer_prefix(text: str, max_len: int) -> torch.Tensor:
+        """Encode prompt and ensure 'Answer:' suffix is present by reserving space.
+
+        This prevents truncation from dropping the answer cue.
+        """
+        ans = "Answer:"
+        toks_ans = tok(ans, padding=False, truncation=False, return_tensors="pt")["input_ids"]
+        ans_len = int(toks_ans.size(1))
+        keep_len = max(1, max_len - ans_len)
+        toks_text = tok(text, padding=False, truncation=True, max_length=keep_len, return_tensors="pt")["input_ids"]
+        ids = torch.cat([toks_text, toks_ans], dim=1)
+        if ids.size(1) > max_len:
+            # As a last resort, keep the tail to preserve 'Answer:'
+            ids = ids[:, -max_len:]
+        return ids.to(device)
+
     rows = _load_rows(data_path)
     if args.limit:
         rows = rows[: int(args.limit)]
@@ -242,6 +259,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     total_em = 0.0
     total_f1 = 0.0
     total_n = 0
+    inj_em = inj_f1 = 0.0
+    inj_n = 0
+    ninj_em = ninj_f1 = 0.0
+    ninj_n = 0
 
     cache_root = Path(str(args.cache_dir))
     dump_fp = None
@@ -320,12 +341,22 @@ def main(argv: Iterable[str] | None = None) -> int:
                     inp_text = f"Question: {q}\nContext: {combined}\nAnswer:"
                     summary_injected = True
                 summary_injected = True
-        enc = tok(inp_text, padding=False, truncation=True, max_length=gpt.config.block_size, return_tensors="pt")
-        input_ids = enc["input_ids"].to(device)
-        pred = generate_answer(gpt, block, mope_layer, tok, input_ids, max_new_tokens=int(args.max_new_tokens), temperature=float(args.temperature), top_k=args.top_k)
+        input_ids = _encode_with_answer_prefix(inp_text, int(gpt.config.block_size))
+        # Deterministic decoding option
+        temp = 0.0 if bool(args.deterministic) else float(args.temperature)
+        k = None if bool(args.deterministic) else args.top_k
+        pred = generate_answer(gpt, block, mope_layer, tok, input_ids, max_new_tokens=int(args.max_new_tokens), temperature=temp, top_k=k)
         if a:
             total_em += _exact_match(pred, a)
             total_f1 += _f1_score(pred, a)
+            if summary_injected:
+                inj_em += _exact_match(pred, a)
+                inj_f1 += _f1_score(pred, a)
+                inj_n += 1
+            else:
+                ninj_em += _exact_match(pred, a)
+                ninj_f1 += _f1_score(pred, a)
+                ninj_n += 1
         total_n += 1
         if dump_fp is not None:
             try:
@@ -352,7 +383,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 5
 
     em = total_em / total_n
-    f1 = total_f1 / total_n if total_f1 > 0 else 0.0
+    f1 = total_f1 / total_n if total_n > 0 else 0.0
+    inj_stats = {
+        "samples": inj_n,
+        "em": round(inj_em / inj_n, 4) if inj_n > 0 else None,
+        "f1": round(inj_f1 / inj_n, 4) if inj_n > 0 else None,
+    }
+    ninj_stats = {
+        "samples": ninj_n,
+        "em": round(ninj_em / ninj_n, 4) if ninj_n > 0 else None,
+        "f1": round(ninj_f1 / ninj_n, 4) if ninj_n > 0 else None,
+    }
     print(json.dumps({
         "samples": total_n,
         "em": round(em, 4),
@@ -362,9 +403,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             "layer_idx": int(args.layer_idx),
             "use_adapters": bool(args.use_adapters),
             "max_new_tokens": int(args.max_new_tokens),
-            "temperature": float(args.temperature),
-            "top_k": args.top_k,
+            "temperature": float(temp),
+            "top_k": k,
+            "deterministic": bool(args.deterministic),
         },
+        "groups": {
+            "injected": inj_stats,
+            "not_injected": ninj_stats,
+        }
     }, ensure_ascii=False, indent=2))
 
     if dump_fp is not None:
