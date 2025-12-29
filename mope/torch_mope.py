@@ -76,6 +76,7 @@ class TorchMoPELayer(nn.Module):
         self.vectorizer = TorchHashVectorizer(dim=hidden_size)
         self.gate = TorchSimpleGate(TorchGateConfig(hidden_size=hidden_size, num_experts=len(self.expert_names), temperature=temperature))
         self.use_adapters = bool(use_adapters)
+        self.alpha: float = 1.0  # residual scaling factor
         # RL-related controls
         self.stochastic: bool = False  # if True (and training), sample expert; else use argmax
         self._forced_expert: int | None = None  # when set, force using this expert once
@@ -114,6 +115,9 @@ class TorchMoPELayer(nn.Module):
         """
         self._forced_expert = int(expert_idx) if expert_idx is not None else None
 
+    def set_alpha(self, alpha: float) -> None:
+        self.alpha = float(alpha)
+
     def forward(self, hidden_state: torch.Tensor, prompt: str) -> torch.Tensor:
         # hidden_state: [H]
         # choose expert index
@@ -131,6 +135,9 @@ class TorchMoPELayer(nn.Module):
             update = self.expert_adapters[expert_idx](hidden_state)
         else:
             update = self.vectorizer.encode(f"[{expert_name}] {prompt or ''}")
+        # scale residual by alpha
+        if isinstance(update, torch.Tensor):
+            update = update * self.alpha
         return self.vectorizer.residual_add(hidden_state, update)
 
     def compute_gate_ce(self, hidden_batch: torch.Tensor, label_indices: torch.Tensor) -> torch.Tensor:

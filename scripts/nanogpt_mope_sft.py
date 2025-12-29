@@ -1,29 +1,29 @@
-"""SFT for MoPE gate integrated with nanoGPT hidden states (PyTorch).
+"""Unified MoPE SFT for nanoGPT (supports GPT-2 pretrained + tokenizer).
 
-This script:
-- Loads a nanoGPT `GPT` model (from the adjacent nanoGPT repo or installed module)
-- Replaces one Block's FFN with TorchMoPE (gate is trainable)
-- Builds a small supervised routing dataset from a JSON/JSONL file
-- Runs a training loop that collects the pre-FFN hidden vectors (ln_2 output)
-  and optimizes the MoPE gate with cross-entropy on expert labels
-
-Notes:
-- We DO NOT train the GPT; only the MoPE gate parameters are updated.
-- External tools are disabled during training; TorchMoPE uses hash vectorizer.
-- Tokenization is byte-level fallback (no extra deps). For better results you
-  can wire in a proper tokenizer.
+Features:
+- Loads nanoGPT GPT with GPT-2 pretrained weights (requires transformers)
+- GPT-2 tokenizer with padding to block_size (pad token = eos)
+- Replaces one Block's FFN with TorchMoPE; trains MoPE gate (and optional adapters)
+- Optional partial unfreezing of last N GPT blocks
+- Joint loss: LM loss (from GPT) + routing CE loss (from MoPE gate)
+- AMP (mixed precision), gradient accumulation, warmup+cosine LR
 
 Example (Windows PowerShell):
 
-  python -m scripts.nanogpt_mope_sft ^
-    --input data/WebAgentSFTDataset.json ^
-    --epochs 20 --batch-size 64 --lr 0.05 ^
-    --layer-idx 0 --hidden-size 512 ^
-    --out gate.json
-
-Optionally init from prior gate:
-
-  python -m scripts.nanogpt_mope_sft --input data.jsonl --gate-json gate.json
+    python -m scripts.nanogpt_mope_sft `
+        --input "data/WebAgentSFTDataset.json" `
+        --nanogpt-root "e:/Edge Download/nanoGPT-master" `
+        --model-type gpt2 `
+        --layer-idx 0 `
+        --unfreeze-last 1 `
+        --epochs 3 `
+        --batch-size 8 `
+        --grad-accum-steps 4 `
+        --lr 5e-5 `
+        --weight-decay 0.01 `
+        --warmup-steps 100 `
+        --amp `
+        --out gate.json
 """
 from __future__ import annotations
 
@@ -36,10 +36,10 @@ from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
-# Local imports from MoPE
-from mope.pipeline import PIPELINE_REGISTRY
 from mope.data_prep import preprocess_record, build_route_batch_from_structured
+from mope.pipeline import PIPELINE_REGISTRY
 from mope.nanogpt_integration import replace_ffn_with_torch_mope
 
 
@@ -81,21 +81,26 @@ def _load_records(path: Path) -> List[dict]:
     return items
 
 
-def _byte_encode(texts: List[str], block_size: int, vocab_size: int) -> torch.Tensor:
-    # Simple byte-level encoding into [B, T] with truncation/padding
-    # vocab_size should be >= 256 for raw bytes; if smaller, mod it
-    B = len(texts)
-    T = block_size
-    x = torch.zeros(B, T, dtype=torch.long)
-    for i, s in enumerate(texts):
-        bs = s.encode("utf-8", errors="ignore")
-        ids = [(b % vocab_size) for b in bs[:T]]
-        if len(ids) > 0:
-            x[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-    return x
+from dataclasses import dataclass
+from typing import NamedTuple
+
+@dataclass
+class Sample:
+    text: str
+    label_idx: int
+
+class RouteDataset(Dataset[Sample]):
+    def __init__(self, samples: List[Sample]) -> None:
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Sample:
+        return self.samples[idx]
 
 
-def _build_dataset(input_path: Path, hidden_size: int) -> Tuple[List[str], List[int], List[str]]:
+def _build_dataset(input_path: Path, hidden_size: int) -> Tuple[List[Sample], List[str]]:
     raw = _load_records(input_path)
     structured = [
         preprocess_record(r, hidden_size=hidden_size, with_instruction=False, drop_observation_content=True)
@@ -103,73 +108,113 @@ def _build_dataset(input_path: Path, hidden_size: int) -> Tuple[List[str], List[
     ]
     structured = [s for s in structured if (s.get("supervision") or {}).get("pipeline_label")]
     batch = build_route_batch_from_structured(structured, hidden_size=hidden_size)
-    # map labels to expert names from registry order to keep consistent
     expert_names = list(PIPELINE_REGISTRY.keys())
     name_to_idx = {n: i for i, n in enumerate(expert_names)}
-    label_idx: List[int] = [name_to_idx.get(lbl, -1) for lbl in batch.labels]
-    # filter out unknown labels (shouldn't happen if registry stable)
-    keep: List[int] = [i for i, y in enumerate(label_idx) if y >= 0]
-    prompts = [batch.prompts[i] for i in keep]
-    labels = [label_idx[i] for i in keep]
-    return prompts, labels, expert_names
+    samples: List[Sample] = []
+    for prompt, lbl in zip(batch.prompts, batch.labels):
+        if lbl not in name_to_idx:
+            continue
+        samples.append(Sample(text=prompt, label_idx=name_to_idx[lbl]))
+    return samples, expert_names
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="nanogpt_mope_sft")
-    p.add_argument("--input", type=str, required=True, help="Path to JSON/JSONL with CoA-style outputs")
-    p.add_argument("--nanogpt-root", type=str, default=None, help="Path to nanoGPT repo root (where model.py lives)")
-    p.add_argument("--layer-idx", type=int, default=0, help="Which Block index to replace and extract features from")
-    p.add_argument("--hidden-size", type=int, default=512, help="Model hidden size; must match GPT n_embd")
-    p.add_argument("--vocab-size", type=int, default=256, help="Tokenizer vocab size (byte-level fallback)")
-    p.add_argument("--block-size", type=int, default=256, help="Context length")
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=0.05)
-    p.add_argument("--gate-json", type=str, default=None, help="Optional gate.json to init weights")
-    p.add_argument("--out", type=str, default="gate.json", help="Where to save trained gate")
-    args = p.parse_args(list(argv) if argv is not None else None)
+    ap = argparse.ArgumentParser(prog="nanogpt_mope_sft")
+    ap.add_argument("--input", type=str, required=True)
+    ap.add_argument("--nanogpt-root", type=str, required=True)
+    ap.add_argument("--model-type", type=str, default="gpt2", choices=["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"])
+    ap.add_argument("--layer-idx", type=int, default=0)
+    ap.add_argument("--block-size", type=int, default=512)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--grad-accum-steps", type=int, default=1)
+    ap.add_argument("--lr", type=float, default=5e-5)
+    ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--warmup-steps", type=int, default=100)
+    ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--unfreeze-last", type=int, default=0, help="Unfreeze last N GPT blocks (0 keeps GPT frozen)")
+    ap.add_argument("--lm-weight", type=float, default=1.0)
+    ap.add_argument("--route-weight", type=float, default=1.0)
+    ap.add_argument("--gate-json", type=str, default=None)
+    ap.add_argument("--use-adapters", action="store_true", help="Use trainable expert adapters inside MoPE (default)")
+    ap.add_argument("--no-adapters", dest="use_adapters", action="store_false", help="Disable adapters; use vectorizer-only residuals")
+    ap.set_defaults(use_adapters=True)
+    ap.add_argument("--out", type=str, default="gate.json")
+    args = ap.parse_args(list(argv) if argv is not None else None)
 
     input_path = Path(args.input)
     if not input_path.exists():
-        print("Input file not found:", input_path)
+        print("Input not found:", input_path)
         return 2
 
-    # Make sure nanoGPT can be imported
-    if args.nanogpt_root:
-        _maybe_add_repo_to_syspath(Path(args.nanogpt_root))
-
+    # Import nanoGPT and transformers
+    _maybe_add_repo_to_syspath(Path(args.nanogpt_root))
     try:
-        from model import GPT, GPTConfig  # nanoGPT's model.py
+        from model import GPT  # type: ignore
     except Exception as e:
-        print("Failed to import nanoGPT model; ensure --nanogpt-root points to nanoGPT repo")
-        print("Error:", e)
+        print("Failed to import nanoGPT model.py from --nanogpt-root:", e)
         return 3
+    try:
+        from transformers import GPT2TokenizerFast
+    except Exception as e:
+        print("transformers is required: pip install transformers")
+        print("Error:", e)
+        return 4
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build a small GPT from scratch (no pretraining) for feature extraction
-    cfg = GPTConfig(
-        block_size=int(args.block_size),
-        vocab_size=int(args.vocab_size),
-        n_layer=max(args.layer_idx + 1, 1),
-        n_head=8,
-        n_embd=int(args.hidden_size),
-        dropout=0.0,
-        bias=True,
-    )
-    gpt = GPT(cfg).to(device)
-    # freeze GPT parameters (we only train the MoPE gate)
-    for p_ in gpt.parameters():
-        p_.requires_grad_(False)
+    # Load pretrained GPT-2 weights into nanoGPT GPT
+    gpt = GPT.from_pretrained(args.model_type)
+    # Adjust block size if needed
+    if args.block_size < gpt.config.block_size:
+        gpt.crop_block_size(args.block_size)
+    gpt.to(device)
 
-    # Build dataset (prompts + labels mapped to expert indices)
-    prompts, labels, expert_names = _build_dataset(input_path, hidden_size=args.hidden_size)
-    if len(prompts) == 0:
-        print("No labeled samples found after preprocessing. Exiting.")
+    # Freeze by default
+    for p in gpt.parameters():
+        p.requires_grad_(False)
+    # Optionally unfreeze last N blocks
+    if args.unfreeze_last > 0:
+        n = len(gpt.transformer.h)
+        start = max(0, n - int(args.unfreeze_last))
+        for i in range(start, n):
+            for p in gpt.transformer.h[i].parameters():
+                p.requires_grad_(True)
+
+    # Build dataset
+    hidden_size = int(getattr(gpt.config, "n_embd", 768))
+    samples, expert_names = _build_dataset(input_path, hidden_size=hidden_size)
+    if len(samples) == 0:
+        print("No labeled samples found. Exiting.")
         return 1
 
-    # Replace selected Block's FFN with TorchMoPE
-    block = gpt.transformer.h[args.layer_idx]
+    # Tokenizer
+    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+    tok.pad_token = tok.eos_token
+
+    def collate(batch: List[Sample]) -> Dict[str, torch.Tensor]:
+        texts = [s.text for s in batch]
+        enc = tok(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=gpt.config.block_size,
+            return_tensors="pt",
+        )
+        input_ids = enc["input_ids"]  # [B,T]
+        attn = enc["attention_mask"]  # [B,T]
+        targets = input_ids.clone()
+        targets[attn == 0] = -1
+        labels = torch.tensor([s.label_idx for s in batch], dtype=torch.long)
+        return {"input_ids": input_ids, "attention_mask": attn, "targets": targets, "route_labels": labels}
+
+    # DataLoader
+    import random
+    random.shuffle(samples)
+    train_loader = DataLoader(RouteDataset(samples), batch_size=int(args.batch_size), shuffle=True, collate_fn=collate)
+
+    # Replace FFN with TorchMoPE on selected layer
+    block = gpt.transformer.h[int(args.layer_idx)]
     gate_init = None
     if args.gate_json and Path(args.gate_json).exists():
         try:
@@ -177,82 +222,112 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("Loaded gate init from", args.gate_json)
         except Exception as e:
             print("Failed to load gate json:", e)
-    mope_layer = replace_ffn_with_torch_mope(block, hidden_size=args.hidden_size, expert_names=expert_names, gate_json=gate_init)
-    mope_layer = mope_layer.to(device)
+    mope_layer = replace_ffn_with_torch_mope(
+        block,
+        hidden_size=hidden_size,
+        expert_names=expert_names,
+        gate_json=gate_init,
+        use_adapters=bool(args.use_adapters),
+    )
+    mope_layer.to(device)
 
-    # Optimizer over MoPE gate only
-    opt = torch.optim.SGD(mope_layer.parameters(), lr=float(args.lr))
+    # Optimizer: MoPE + optionally unfrozen GPT parameters (deduplicated)
+    params: List[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    def add_param(p: torch.nn.Parameter) -> None:
+        if p.requires_grad and id(p) not in seen:
+            params.append(p)
+            seen.add(id(p))
 
-    # Register a forward hook on ln_2 to capture pre-FFN features
+    for p in mope_layer.parameters():
+        add_param(p)
+    if args.unfreeze_last > 0:
+        for p in gpt.parameters():
+            add_param(p)
+    optimizer = torch.optim.AdamW(params, lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+    # Scheduler: warmup + cosine
+    import math
+    total_steps = max(1, math.ceil(len(train_loader) / max(1, int(args.grad_accum_steps))) * int(args.epochs))
+    def lr_lambda(step: int) -> float:
+        if step < int(args.warmup_steps):
+            return float(step + 1) / float(max(1, int(args.warmup_steps)))
+        progress = (step - int(args.warmup_steps)) / max(1, total_steps - int(args.warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Hook to capture pre-FFN features (ln_2 output)
     captured: List[torch.Tensor] = []
-
     def hook_ln2(_module, _inp, out):
-        # out is ln_2(x): shape [B, T, H]
-        captured.append(out.detach())
+        captured.append(out)
+    h = block.ln_2.register_forward_hook(hook_ln2)
 
-    hook_handle = block.ln_2.register_forward_hook(hook_ln2)
+    # AMP
+    _dev_str = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(_dev_str, enabled=bool(args.amp) and device.type == "cuda")
 
-    def run_epoch(texts: List[str], y: List[int], batch_size: int) -> Tuple[float, float]:
-        gpt.eval()
-        mope_layer.train()
-        total_loss = 0.0
-        total_count = 0
-        correct = 0
-        with torch.enable_grad():
-            for start in range(0, len(texts), batch_size):
-                end = min(start + batch_size, len(texts))
-                batch_txt = texts[start:end]
-                batch_y = torch.tensor(y[start:end], dtype=torch.long, device=device)
+    gpt.train()  # we'll compute LM loss; some params may be frozen
+    for epoch in range(int(args.epochs)):
+        total_lm = 0.0
+        total_route = 0.0
+        total_n = 0
+        step_idx = 0
+        optimizer.zero_grad(set_to_none=True)
 
-                # Build token tensor
-                idx = _byte_encode(batch_txt, block_size=args.block_size, vocab_size=args.vocab_size).to(device)
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(device)
+            attn = batch["attention_mask"].to(device)
+            targets = batch["targets"].to(device)
+            y_route = batch["route_labels"].to(device)
 
-                # Forward through GPT to collect ln_2 output
+            with torch.amp.autocast(device_type=device.type, enabled=bool(args.amp) and device.type == "cuda"):
                 captured.clear()
-                _ = gpt(idx)  # logits, loss (ignored)
+                logits, lm_loss = gpt(input_ids, targets=targets)
                 if not captured:
                     raise RuntimeError("ln_2 hook did not capture features; check layer index")
-                feats = captured[-1]  # [B, T, H]
-                X = feats[:, -1, :]  # last position representation [B, H]
+                feats = captured[-1]  # [B,T,H]
+                lengths = attn.sum(dim=1)
+                idx_last = (lengths - 1).clamp(min=0).unsqueeze(1).unsqueeze(2).expand(-1, 1, feats.size(-1))
+                X = feats.gather(dim=1, index=idx_last).squeeze(1)  # [B,H]
+                route_loss = mope_layer.compute_gate_ce(X, y_route)
+                loss = float(args.lm_weight) * lm_loss + float(args.route_weight) * route_loss
 
-                opt.zero_grad()
-                loss = mope_layer.compute_gate_ce(X, batch_y)
-                loss.backward()
-                opt.step()
+            scaler.scale(loss).backward()
 
-                total_loss += float(loss.item()) * X.size(0)
-                total_count += X.size(0)
+            total_lm += float(lm_loss.item()) * input_ids.size(0)
+            total_route += float(route_loss.item()) * input_ids.size(0)
+            total_n += int(input_ids.size(0))
 
-                with torch.no_grad():
-                    logits = X @ mope_layer.gate.weight + mope_layer.gate.bias
-                    pred = torch.argmax(logits, dim=-1)
-                    correct += int((pred == batch_y).sum().item())
+            if (step_idx + 1) % int(args.grad_accum_steps) == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+            step_idx += 1
 
-        avg_loss = total_loss / max(total_count, 1)
-        acc = correct / max(total_count, 1)
-        return avg_loss, acc
+        avg_lm = total_lm / max(1, total_n)
+        avg_route = total_route / max(1, total_n)
+        print(f"epoch {epoch+1}/{args.epochs} lm_loss={avg_lm:.4f} route_ce={avg_route:.4f} lr={scheduler.get_last_lr()[0]:.2e}")
 
-    for epoch in range(int(args.epochs)):
-        loss, acc = run_epoch(prompts, labels, int(args.batch_size))
-        print(f"epoch {epoch+1}/{args.epochs} gate_ce={loss:.4f} acc={acc:.4f}")
-
-    # Save gate weights to json
+    # Save trained gate
     out = {
         "weight": mope_layer.gate.weight.detach().cpu().tolist(),
         "bias": mope_layer.gate.bias.detach().cpu().tolist(),
         "config": {
-            "hidden_size": int(args.hidden_size),
+            "hidden_size": hidden_size,
             "num_experts": len(expert_names),
             "temperature": 1.0,
         },
         "experts": expert_names,
+        "meta": {
+            "model_type": args.model_type,
+            "layer_idx": int(args.layer_idx),
+        },
     }
-    out_path = Path(args.out)
-    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("Saved gate to", out_path)
+    Path(args.out).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Saved gate to", args.out)
 
-    # cleanup
-    hook_handle.remove()
+    h.remove()
     return 0
 
 

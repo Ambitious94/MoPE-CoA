@@ -79,7 +79,78 @@ curl -X POST http://127.0.0.1:8000/ask -H "Content-Type: application/json" -d "{
 - MoPE 层与模型：`mope.mope_layer.MoPELayer`, `mope.model.MoPETransformer`
 - nanoGPT 适配：`mope.nanogpt_integration.attach_mope_to_nanogpt`, `make_mock_nanogpt`
 
-## nanoGPT 集成示例
+## HF/Qwen 集成与训练阶段建议
+
+推荐训练顺序（稳定性优先）：
+
+1) 阶段 1：结构对齐（蒸馏）
+      - teacher：原始 Qwen（不插 MoPE）
+      - student：插入 MoPE 的 Qwen（仅替换末端 1–2 层），`alpha≈0.01`
+      - loss：KL(logits) 为主，MSE(hidden) 可选
+      - 目标：插入 MoPE 后，模型仍能“像原来一样说话”
+
+2) 阶段 2：SFT（CoA/QA）
+      - 输出强制 `<think>...</think><answer>...</answer>`
+      - 观察 `observation` 字段不计入 loss（mask）
+      - 先用离线工具回放，稳定格式后再接真实检索/爬取
+
+3) 阶段 3：Pipeline Experts（文本→向量）
+      - pipeline 的文本输出需经轻量 encoder/pooling 映射回 `hidden_size`
+      - MoPE 始终以 `hidden = hidden + alpha * delta` 的残差形式输出
+      - 分阶段引入，避免一次性耦合过多改动
+
+Quick start（冒烟/蒸馏）：
+
+```powershell
+# 冒烟：加载 Qwen、在指定层挂 MoPE 并生成（36 层：末端两层为 34,35）
+python -m scripts.qwen.smoke `
+      --model Qwen/Qwen2.5-3B-Instruct `
+      --layers 34,35 `
+      --alpha 0.01 `
+      --dtype float16 `
+      --device-map auto
+
+# 蒸馏：teacher→student（仅训 gate/alpha；如需也训练适配器，加入 --train-adapters）
+python -m scripts.qwen.distill `
+      --teacher Qwen/Qwen2.5-3B-Instruct `
+      --student Qwen/Qwen2.5-3B-Instruct `
+      --layers 34,35 `
+      --alpha 0.01 `
+      --max-steps 200 `
+      --lr 1e-4 `
+      --dtype float16 `
+      --device-map auto
+```
+
+gate.json 兼容性：
+- `gate.weight` 形状必须为 `[hidden_size, num_experts]`；`gate.bias` 为 `[num_experts]`
+- 从 GPT-2（768）迁移到 Qwen（更大维度）时，旧 gate.json 不可直接复用；建议重新初始化并短训校准
+
+## nanoGPT 集成示例（Legacy）
+### nanoGPT SFT（分目录）
+
+在新的分目录结构下，使用包装脚本运行统一的 SFT：
+
+```powershell
+# 查看参数帮助（与旧脚本一致）
+python -m scripts.nanogpt.sft --help
+
+# 示例训练（请根据你的路径与数据修改）
+python -m scripts.nanogpt.sft `
+      --input "data/WebAgentSFTDataset.json" `
+      --nanogpt-root "e:/Edge Download/nanoGPT-master" `
+      --model-type gpt2 `
+      --layer-idx 0 `
+      --unfreeze-last 1 `
+      --epochs 3 `
+      --batch-size 8 `
+      --grad-accum-steps 4 `
+      --lr 5e-5 `
+      --weight-decay 0.01 `
+      --warmup-steps 100 `
+      --amp `
+      --out gate.json
+```
 
 ```python
 from mope.retrieval import DocumentStore
