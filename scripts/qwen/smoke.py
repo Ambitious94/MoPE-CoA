@@ -36,7 +36,7 @@ def main() -> int:
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True, local_files_only=is_local)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map=args.device_map,
         local_files_only=is_local,
     )

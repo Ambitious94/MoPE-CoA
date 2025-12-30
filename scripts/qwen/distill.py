@@ -51,9 +51,22 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     print(f"Loading teacher={args.teacher} student={args.student} dtype={args.dtype}")
-    tok = AutoTokenizer.from_pretrained(args.teacher)
-    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, torch_dtype=dtype, device_map=args.device_map)
-    student = AutoModelForCausalLM.from_pretrained(args.student, torch_dtype=dtype, device_map=args.device_map)
+    # Local/HF hub detection for teacher
+    t_is_abs = os.path.isabs(args.teacher) or str(args.teacher).startswith("/") or str(args.teacher).startswith(".")
+    s_is_abs = os.path.isabs(args.student) or str(args.student).startswith("/") or str(args.student).startswith(".")
+    if t_is_abs and not os.path.isdir(args.teacher):
+        print("Local teacher directory not found:", args.teacher)
+        return 2
+    if s_is_abs and not os.path.isdir(args.student):
+        print("Local student directory not found:", args.student)
+        return 2
+    t_is_local = os.path.isdir(args.teacher)
+    s_is_local = os.path.isdir(args.student)
+    print(("Loading local teacher from" if t_is_local else "Loading teacher from Hub:"), args.teacher)
+    print(("Loading local student from" if s_is_local else "Loading student from Hub:"), args.student)
+    tok = AutoTokenizer.from_pretrained(args.teacher, use_fast=True, local_files_only=t_is_local)
+    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, dtype=dtype, device_map=args.device_map, local_files_only=t_is_local)
+    student = AutoModelForCausalLM.from_pretrained(args.student, dtype=dtype, device_map=args.device_map, local_files_only=s_is_local)
 
     hidden_size = int(getattr(getattr(student, "config", object()), "hidden_size", 0) or 0)
     if hidden_size <= 0:

@@ -79,8 +79,9 @@ def attach_mope_to_hf_model(
         if gate_json is not None:
             mope.load_gate_json(gate_json)
         mope.set_alpha(alpha)
-        # Preserve device/dtype
-        mope.to(next(model.parameters()).device)
+        # Preserve device and dtype to match the base model
+        _p = next(model.parameters())
+        mope.to(device=_p.device, dtype=_p.dtype)
         setattr(block, target_attr, MoPEFFN(mope))
         mope_layers.append(mope)
 

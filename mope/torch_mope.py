@@ -99,8 +99,10 @@ class TorchMoPELayer(nn.Module):
 
     @torch.no_grad()
     def load_gate_json(self, gate_json: dict) -> None:
-        w = torch.tensor(gate_json.get("weight"), dtype=torch.float32)
-        b = torch.tensor(gate_json.get("bias"), dtype=torch.float32)
+        # Load with current gate parameter dtype to avoid dtype mismatch during matmul
+        param_dtype = self.gate.weight.dtype
+        w = torch.tensor(gate_json.get("weight"), dtype=param_dtype)
+        b = torch.tensor(gate_json.get("bias"), dtype=param_dtype)
         if w.shape != self.gate.weight.shape:
             raise ValueError(f"gate weight shape mismatch: {w.shape} vs {tuple(self.gate.weight.shape)}")
         if b.shape != self.gate.bias.shape:
